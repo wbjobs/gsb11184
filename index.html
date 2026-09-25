@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>标签页广播确认工具</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      background: #f4f6f8; color: #222; padding: 20px;
+      max-width: 860px; margin: 0 auto;
+    }
+    h1 { font-size: 20px; margin-bottom: 12px; }
+    .card {
+      background: #fff; border: 1px solid #e2e6ea; border-radius: 8px;
+      padding: 14px 16px; margin-bottom: 14px;
+    }
+    .card h2 { font-size: 15px; margin-bottom: 10px; color: #444; }
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .muted { color: #888; font-size: 12px; }
+    code { background: #eef1f4; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+    input[type="text"] {
+      flex: 1; min-width: 200px; padding: 7px 10px;
+      border: 1px solid #ccd2d8; border-radius: 6px; font-size: 14px;
+    }
+    button {
+      padding: 7px 14px; border: none; border-radius: 6px; cursor: pointer;
+      background: #2563eb; color: #fff; font-size: 14px;
+    }
+    button.secondary { background: #64748b; }
+    button:disabled { background: #b6c2d2; cursor: not-allowed; }
+    .stats { display: flex; gap: 18px; margin-top: 10px; font-size: 14px; }
+    .stats b { font-size: 20px; }
+    .ok b { color: #16a34a; } .pending b { color: #d97706; } .timeout b { color: #dc2626; }
+    #cv { display: block; margin-top: 10px; background: #fafbfc; border: 1px solid #e5e9ee; border-radius: 6px; }
+    .msg-box {
+      margin-top: 8px; padding: 10px 12px; border-radius: 6px;
+      background: #f0f7ff; border: 1px solid #d3e4fb; font-size: 14px;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 10px;
+      font-size: 12px; background: #e2e8f0; color: #475569;
+    }
+    .badge.me { background: #dbeafe; color: #1d4ed8; }
+    label.chk { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #b91c1c; }
+    #log {
+      height: 140px; overflow-y: auto; font-family: ui-monospace, monospace;
+      font-size: 12px; background: #0f172a; color: #a5f3a5;
+      padding: 8px 10px; border-radius: 6px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>标签页广播确认工具</h1>
+
+  <div class="card">
+    <div class="row">
+      <span>本标签页：<code id="myId"></code></span>
+      <span class="muted">在线标签页（含自己）：<b id="onlineCount">1</b></span>
+    </div>
+    <div class="row" style="margin-top:8px" id="rosterRow">
+      <span class="muted">在线列表：</span><span id="roster"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>发送广播（任意标签页都可以当发送方）</h2>
+    <div class="row">
+      <input type="text" id="msgInput" placeholder="输入要广播的消息…" value="大家好，请确认收到">
+      <button id="sendBtn">发送广播</button>
+      <button id="staleBtn" class="secondary" title="重发一条过期序号的消息，验证接收方不会误判">注入乱序消息</button>
+    </div>
+    <div id="senderArea" style="display:none">
+      <div class="stats">
+        <span class="ok">已确认 <b id="cAck">0</b></span>
+        <span class="pending">未确认 <b id="cPending">0</b></span>
+        <span class="timeout">超时 <b id="cTimeout">0</b></span>
+        <span class="muted" id="retryInfo"></span>
+      </div>
+      <canvas id="cv" width="820" height="120"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>接收区</h2>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="loseAck"> 模拟确认丢失（收到后不回复 ACK）</label>
+    </div>
+    <div class="msg-box" id="recvBox">暂无收到的广播</div>
+  </div>
+
+  <div class="card">
+    <h2>事件日志</h2>
+    <div id="log"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
