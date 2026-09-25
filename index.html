@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>标签页广播确认工具</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6f8; color: #222; }
+  header { background: #1f2937; color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .meta { font-size: 12px; opacity: .85; }
+  main { max-width: 900px; margin: 16px auto; padding: 0 16px; display: grid; gap: 14px; }
+  .card { background: #fff; border: 1px solid #e3e5e8; border-radius: 8px; padding: 14px 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 10px; color: #374151; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 200px; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; }
+  button { padding: 8px 16px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; font-size: 14px; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  .stats { display: flex; gap: 18px; font-size: 14px; }
+  .stats b { font-size: 20px; display: block; }
+  .ok b { color: #16a34a; } .pend b { color: #d97706; } .to b { color: #dc2626; }
+  canvas { width: 100%; height: 180px; display: block; background: #fafafa; border-radius: 6px; }
+  #roster { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+  #roster li { padding: 3px 8px; border-radius: 10px; background: #eef2ff; color: #3730a3; }
+  #roster li.me { background: #dcfce7; color: #166534; }
+  #log { font-size: 12px; font-family: ui-monospace, monospace; max-height: 140px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+  #log li { padding: 2px 0; border-bottom: 1px dashed #eee; color: #4b5563; }
+  label.chk { font-size: 13px; color: #6b7280; display: flex; align-items: center; gap: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>标签页广播确认工具</h1>
+  <span class="meta">本标签页 ID：<b id="myId"></b></span>
+  <span class="meta">在线标签页：<b id="onlineCount">1</b></span>
+</header>
+<main>
+  <section class="card">
+    <h2>发送广播（任意标签页均可作为发送方）</h2>
+    <div class="row">
+      <input type="text" id="msgInput" placeholder="广播内容（留空则自动生成）">
+      <button id="sendBtn">发送广播</button>
+      <label class="chk"><input type="checkbox" id="dropAck"> 模拟确认丢失（测试超时重发）</label>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>确认统计（当前轮次）</h2>
+    <div class="stats">
+      <div class="ok">已确认<b id="cAck">0</b></div>
+      <div class="pend">未确认<b id="cPend">0</b></div>
+      <div class="to">超时<b id="cTo">0</b></div>
+      <div>状态<b id="roundState" style="font-size:14px;line-height:28px">空闲</b></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>确认状态可视化（绿=已确认 橙=待确认 红=超时 蓝=本页 灰=空闲）</h2>
+    <canvas id="cv"></canvas>
+  </section>
+
+  <section class="card">
+    <h2>在线标签页</h2>
+    <ul id="roster"></ul>
+  </section>
+
+  <section class="card">
+    <h2>日志</h2>
+    <ul id="log"></ul>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+/* ---------- 标签页身份：sessionStorage 保证刷新后 ID 不变，新标签页获得新 ID ---------- */
+const TAB_ID = (() => {
+  let id = sessionStorage.getItem('tabId');
+  if (!id) {
+    id = (crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : Math.random().toString(36).slice(2, 10));
+    sessionStorage.setItem('tabId', id);
+  }
+  return id;
+})();
+
+const CHANNEL = 'tab-broadcast-ack-demo';
+const HB_INTERVAL = 2000;    // 心跳间隔
+const PRUNE_AFTER = 5000;    // 超过该时长无心跳视为离线（处理崩溃/异常关闭）
+const TICK_MS = 3000;        // 每轮确认等待时长
+const MAX_ATTEMPT = 3;       // 最多发送次数（超出记为超时）
+
+const $ = id => document.getElementById(id);
+$('myId').textContent = TAB_ID;
+
+/* ---------- IndexedDB：去重已收消息 + 持久化发送方轮次（刷新后状态一致） ---------- */
+const dbReady = new Promise((resolve, reject) => {
+  const req = indexedDB.open('broadcast-ack-demo', 1);
+  req.onupgradeneeded = () => {
+    req.result.createObjectStore('kv');                       // 发送方轮次状态
+    req.result.createObjectStore('msgs', { keyPath: 'msgId' }); // 接收方已收消息（去重）
+  };
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
+});
+function idb(store, mode, op) {
+  return dbReady.then(db => new Promise((resolve, reject) => {
+    const req = op(db.transaction(store, mode).objectStore(store));
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+const kvGet = k => idb('kv', 'readonly', s => s.get(k));
+const kvSet = (k, v) => idb('kv', 'readwrite', s => s.put(v, k));
+const msgGet = id => idb('msgs', 'readonly', s => s.get(id));
+const msgPut = v => idb('msgs', 'readwrite', s => s.put(v));
+
+/* ---------- 在线名单（心跳维护，动态增删） ---------- */
+const roster = new Map(); // tabId -> lastSeen
+function touch(id) {
+  if (id === TAB_ID) return;
+  roster.set(id, Date.now());
+  renderRoster(); updateStats(); draw();
+}
+setInterval(() => {
+  const now = Date.now();
+  let changed = false;
+  for (const [id, ts] of roster) {
+    if (now - ts > PRUNE_AFTER) { roster.delete(id); changed = true; log('标签页离线（心跳超时）: ' + id); }
+  }
+  if (changed) { renderRoster(); updateStats(); draw(); }
+}, 1000);
+
+/* ---------- 通信 ---------- */
+const bc = new BroadcastChannel(CHANNEL);
+function send(obj) { obj.from = TAB_ID; bc.postMessage(obj); }
+
+bc.onmessage = e => {
+  const m = e.data;
+  if (!m || m.from === TAB_ID) return;
+  switch (m.type) {
+    case 'hello':    touch(m.from); send({ type: 'presence' }); break;
+    case 'presence': touch(m.from); break;
+    case 'hb':       touch(m.from); break;
+    case 'bye':
+      if (roster.delete(m.from)) { log('标签页关闭: ' + m.from); renderRoster(); updateStats(); draw(); }
+      break;
+    case 'msg': onMsg(m); break;
+    case 'ack': onAck(m); break;
+  }
+};
+
+/* ---------- 接收方：IndexedDB 去重，乱序/重复/重发均只记一次，但每次都回确认 ---------- */
+async function onMsg(m) {
+  const known = await msgGet(m.msgId);
+  if (!known) {
+    await msgPut({ msgId: m.msgId, text: m.text, from: m.from, at: Date.now() });
+    log('收到广播 [' + m.msgId.slice(-6) + ']: ' + m.text);
+  }
+  if ($('dropAck').checked) { log('模拟丢失确认: ' + m.msgId.slice(-6)); return; }
+  send({ type: 'ack', msgId: m.msgId, to: m.from });
+}
+
+/* ---------- 发送方：一轮广播的状态机 ---------- */
+let round = null; // { msgId, text, attempt, acks:Set, timedOut:Set, done }
+let tickTimer = null;
+
+async function startRound() {
+  if (round && !round.done) finalizeRound(); // 上一轮未结束的未确认项计入超时
+  const text = $('msgInput').value.trim() || ('广播消息 @ ' + new Date().toLocaleTimeString());
+  round = {
+    msgId: TAB_ID + '-' + Date.now(),
+    text, attempt: 1,
+    acks: new Set(), timedOut: new Set(), done: false
+  };
+  await saveRound();
+  send({ type: 'msg', msgId: round.msgId, text });
+  log('发起广播 [' + round.msgId.slice(-6) + ']: ' + text);
+  scheduleTick();
+  updateStats(); draw();
+}
+
+function pendingTabs() {
+  if (!round || round.done) return [];
+  return [...roster.keys()].filter(id => !round.acks.has(id));
+}
+
+function scheduleTick() { clearTimeout(tickTimer); tickTimer = setTimeout(onTick, TICK_MS); }
+
+async function onTick() {
+  if (!round || round.done) return;
+  const pending = pendingTabs();
+  if (pending.length === 0) { await finishRound('全部标签页已确认'); return; }
+  if (round.attempt < MAX_ATTEMPT) {
+    round.attempt++;
+    await saveRound();
+    send({ type: 'msg', msgId: round.msgId, text: round.text, attempt: round.attempt });
+    log('超时重发 第 ' + round.attempt + '/' + MAX_ATTEMPT + ' 次，未确认: ' + pending.join(', '));
+    scheduleTick();
+  } else {
+    pending.forEach(id => round.timedOut.add(id));
+    await finishRound('超时未确认: ' + pending.join(', '));
+  }
+  updateStats(); draw();
+}
+
+function finalizeRound() {
+  pendingTabs().forEach(id => round.timedOut.add(id));
+  round.done = true;
+}
+
+async function finishRound(msg) {
+  round.done = true;
+  clearTimeout(tickTimer);
+  await saveRound();
+  log(msg);
+}
+
+async function onAck(m) {
+  if (m.to !== TAB_ID || !round || m.msgId !== round.msgId) return; // 乱序/旧轮次确认直接忽略
+  if (round.acks.has(m.from)) return;
+  round.acks.add(m.from);
+  await saveRound();
+  log('收到确认: ' + m.from);
+  if (!round.done && pendingTabs().length === 0) await finishRound('全部标签页已确认');
+  updateStats(); draw();
+}
+
+/* ---------- 轮次持久化：发送方刷新后可恢复继续统计 ---------- */
+function saveRound() {
+  if (!round) return Promise.resolve();
+  return kvSet('round:' + TAB_ID, {
+    msgId: round.msgId, text: round.text, attempt: round.attempt,
+    acks: [...round.acks], timedOut: [...round.timedOut], done: round.done
+  });
+}
+async function restoreRound() {
+  const s = await kvGet('round:' + TAB_ID);
+  if (!s) return;
+  round = { msgId: s.msgId, text: s.text, attempt: s.attempt,
+            acks: new Set(s.acks), timedOut: new Set(s.timedOut), done: s.done };
+  if (!round.done) { log('恢复未完成轮次 [' + round.msgId.slice(-6) + ']，继续统计'); scheduleTick(); }
+  updateStats(); draw();
+}
+
+/* ---------- UI ---------- */
+function updateStats() {
+  $('cAck').textContent = round ? round.acks.size : 0;
+  $('cPend').textContent = pendingTabs().length;
+  $('cTo').textContent = round ? round.timedOut.size : 0;
+  $('roundState').textContent = !round ? '空闲' : round.done ? '已结束' : ('进行中 第' + round.attempt + '次发送');
+  $('onlineCount').textContent = roster.size + 1;
+}
+function renderRoster() {
+  const ul = $('roster');
+  ul.innerHTML = '';
+  const me = document.createElement('li');
+  me.className = 'me'; me.textContent = TAB_ID + '（本页）';
+  ul.appendChild(me);
+  for (const id of roster.keys()) {
+    const li = document.createElement('li');
+    li.textContent = id;
+    ul.appendChild(li);
+  }
+  $('onlineCount').textContent = roster.size + 1;
+}
+function log(msg) {
+  const li = document.createElement('li');
+  li.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  const ul = $('log');
+  ul.prepend(li);
+  while (ul.children.length > 60) ul.lastChild.remove();
+}
+
+/* ---------- Canvas 可视化 ---------- */
+function draw() {
+  const cv = $('cv'), ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const nodes = [TAB_ID, ...roster.keys()];
+  const n = nodes.length;
+  const r = Math.min(26, Math.max(14, (w / Math.max(n, 1)) / 2 - 8));
+  const cy = h / 2 - 6;
+
+  nodes.forEach((id, i) => {
+    const cx = (w / (n + 1)) * (i + 1);
+    let color = '#9ca3af', label = '空闲';
+    if (id === TAB_ID) { color = '#2563eb'; label = '本页'; }
+    else if (round) {
+      if (round.acks.has(id)) { color = '#16a34a'; label = '已确认'; }
+      else if (round.timedOut.has(id)) { color = '#dc2626'; label = '超时'; }
+      else if (!round.done) { color = '#d97706'; label = '待确认'; }
+    }
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(id.slice(0, 4), cx, cy);
+    ctx.fillStyle = '#374151';
+    ctx.font = '11px sans-serif';
+    ctx.fillText(label, cx, cy + r + 14);
+    ctx.fillStyle = '#9ca3af';
+    ctx.fillText(id, cx, cy + r + 28);
+  });
+}
+
+/* ---------- 生命周期 ---------- */
+$('sendBtn').addEventListener('click', startRound);
+$('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter') startRound(); });
+window.addEventListener('beforeunload', () => send({ type: 'bye' })); // 发送方/接收方关闭都会通知，其他页不崩
+window.addEventListener('resize', draw);
+
+setInterval(() => send({ type: 'hb' }), HB_INTERVAL);
+send({ type: 'hello' });
+renderRoster();
+restoreRound();
+</script>
+</body>
+</html>
